@@ -1,0 +1,16 @@
+{
+  "name": "radar-gdelt-collector",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261030.1",
+    "cf": "1.0.0-beta.26",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "dev": "cf dev",
+    "deploy": "cf deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "packageManager": "pnpm@12.16.1"
+}
