@@ -11,8 +11,10 @@
 // Design (see README.md): one firing handles exactly one question and one
 // time window, so a firing stays tiny on the Workers Free plan (10 ms
 // CPU). Which question a firing serves is derived statelessly from the
-// scheduled time (10-minute slots rotating over the questions), so no
-// shared coordination state exists anywhere. The DOC API's 250-record
+// scheduled time (1-minute slots rotating over the questions), so no
+// shared coordination state exists anywhere. A fresh question database
+// backfills from the DOC index horizon (about 3 months back) before
+// settling into steady-state monitoring. The DOC API's 250-record
 // cap is handled by splitting saturated windows in half and queuing the
 // halves in the question's own checkpoint table — the time window is the
 // pagination. Rate limits are handled as state (`not_before`), never by
@@ -49,10 +51,9 @@ const USER_AGENT = "radar-gdelt-collector/0.1 (+https://github.com/kotaroAi-1031
 const MAX_RECORDS = 250;
 const MIN_WINDOW_SEC = 1800; // never split below 30 minutes
 const MAX_WINDOW_SEC = 6 * 3600; // a frontier window covers at most 6 hours
-const FIRST_WINDOW_SEC = 2 * 3600; // first run for a question looks back 2 hours
 const MAX_AGE_SEC = 89 * 86400; // the DOC index covers roughly the last 3 months
 const BACKOFF_SEC = 15 * 60; // matches the ~15 min IP block seen in practice
-const SLOT_SEC = 600; // cron fires every 10 minutes; one question per slot
+const SLOT_SEC = 60; // cron fires every minute; one question per slot
 
 interface Checkpoint {
   next_start: number | null;
@@ -141,7 +142,11 @@ async function collect(db: Client, question: Question): Promise<void> {
     fromPending = true;
   } else {
     end = now;
-    start = cp.next_start ?? end - FIRST_WINDOW_SEC;
+    // A fresh database backfills from the DOC horizon (~3 months): the
+    // frontier starts at the oldest indexed moment and advances
+    // chronologically, with split windows interleaved, until it reaches
+    // the present and settles into steady-state monitoring.
+    start = cp.next_start ?? now - MAX_AGE_SEC;
     start = Math.max(start, now - MAX_AGE_SEC);
     if (end - start > MAX_WINDOW_SEC) end = start + MAX_WINDOW_SEC;
     if (start >= end) {
@@ -253,8 +258,12 @@ async function collect(db: Client, question: Question): Promise<void> {
 
 export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Stateless rotation: the 10-minute slot number picks the question, so
-    // every question is served once per hour with no shared state.
+    // Stateless rotation: the 1-minute slot number picks the question, so
+    // every question is served once per 6 minutes with no shared state.
+    // One call per firing keeps a firing far inside both the DOC API's
+    // per-IP rate budget (one call per minute overall) and the Workers
+    // Free 10 ms CPU budget, while the cadence still drains split queues
+    // and backfill much faster than real time.
     const slot = Math.floor(controller.scheduledTime / (SLOT_SEC * 1000));
     const question = QUESTIONS[slot % QUESTIONS.length];
     ctx.waitUntil(collect(clientFor(env, question.id), question));

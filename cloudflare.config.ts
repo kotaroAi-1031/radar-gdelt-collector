@@ -9,6 +9,6 @@ export default defineConfig({
     name: "radar-gdelt-collector",
     compatibilityDate: "2026-10-15",
     entrypoint,
-    triggers: [triggers.scheduled({ schedule: "*/10 * * * *" })],
+    triggers: [triggers.scheduled({ schedule: "* * * * *" })],
   },
 });

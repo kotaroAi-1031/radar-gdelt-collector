@@ -100,8 +100,11 @@ How it collects, following measured practice for the GDELT DOC 2.0 API
 - A cron firing handles **one watch question and one time window**, so a
   firing stays far inside the Free plan's 10 ms CPU budget. Which
   question a firing serves is derived statelessly from the scheduled
-  time (10-minute slots rotating over the six questions), so no shared
-  coordination state exists anywhere.
+  time (1-minute slots rotating over the six questions), so no shared
+  coordination state exists anywhere. One call per firing keeps every
+  firing far inside the DOC API's per-IP rate budget and the Workers
+  Free CPU budget; a fresh question database backfills from the DOC
+  index horizon (about 3 months) before settling into steady state.
 - The DOC API returns at most 250 articles per query with no pagination.
   When a window comes back saturated, it is **split in half and the
   halves are queued** in the checkpoint state — the time window is the
@@ -120,7 +123,7 @@ How it collects, following measured practice for the GDELT DOC 2.0 API
 Layout:
 
 - `cloudflare.config.ts` — the `cf` CLI project config (Worker name,
-  cron trigger `*/10 * * * *`). There is no storage binding: the Worker
+  cron trigger `* * * * *`). There is no storage binding: the Worker
   connects to the per-question Turso databases with the single
   `TURSO_DATABASES_JSON` secret, a JSON map of question id to
   `{ url, authToken }` (each token scoped to its own database).
