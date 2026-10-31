@@ -83,9 +83,12 @@ GITHUB_REPO="kotaroAi-1031/<new-repo>" pnpm run apply
 
 A GDELT collector for the primary information radar, built on the
 template above. It runs on **Cloudflare Workers Free only** and stores
-what it collects in **D1**; the radar's daily update reads from D1 and
-never calls the public GDELT API itself (collection and reporting are
-separate tasks by design).
+what it collects in **Turso** (libSQL); the radar's daily update reads a
+locally synced replica (Turso sync / embedded replica) and never calls
+the public GDELT API itself (collection and reporting are separate
+tasks by design). Storage was deliberately placed outside Cloudflare so
+that reporting keeps working even when an upstream API or Cloudflare
+itself is unreachable.
 
 How it collects, following measured practice for the GDELT DOC 2.0 API
 (see `src/index.ts` for the implementation):
@@ -111,10 +114,12 @@ How it collects, following measured practice for the GDELT DOC 2.0 API
 Layout:
 
 - `cloudflare.config.ts` — the `cf` CLI project config (Worker name,
-  D1 binding `DB` → database `radar-gdelt`, cron trigger `*/10 * * * *`).
+  cron trigger `*/10 * * * *`). There is no storage binding: the Worker
+  connects to Turso with the `TURSO_DATABASE_URL` and
+  `TURSO_AUTH_TOKEN` secrets.
 - `src/index.ts` — the collector (question queries are v1 keyword sets,
   tuned by the observed run counts).
-- `migrations/` — the D1 schema.
+- `migrations/` — the database schema (applied to Turso).
 
 Tooling: the `cf` CLI (Cloudflare's official agentic CLI, beta) is the
 primary tool, pinned exactly in `package.json`; `cf auth login` performs
