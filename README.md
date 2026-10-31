@@ -76,3 +76,46 @@ GITHUB_REPO="kotaroAi-1031/<new-repo>" pnpm run apply
 - Keep the baseline loose. Extra rules (required reviews, status
   checks) are added per repository when they earn their keep — not
   here, where they would tax every repo created from this template.
+
+---
+
+# radar-gdelt-collector (this repository's project)
+
+A GDELT collector for the primary information radar, built on the
+template above. It runs on **Cloudflare Workers Free only** and stores
+what it collects in **D1**; the radar's daily update reads from D1 and
+never calls the public GDELT API itself (collection and reporting are
+separate tasks by design).
+
+How it collects, following measured practice for the GDELT DOC 2.0 API
+(see `src/index.ts` for the implementation):
+
+- A cron firing handles **one watch question and one time window**, so a
+  firing stays far inside the Free plan's 10 ms CPU budget. Six questions
+  rotate across firings every 10 minutes.
+- The DOC API returns at most 250 articles per query with no pagination.
+  When a window comes back saturated, it is **split in half and the
+  halves are queued** in the checkpoint state — the time window is the
+  pagination. Windows never split below 30 minutes; a window still
+  saturated at that floor is stored and logged as `ok_capped`.
+- Rate limits (measured: roughly one request per 5 s per IP, with IP
+  blocks lasting ~15 minutes after bursts) are handled as **state, not
+  retries**: a failed or refused call defers that question for 15
+  minutes via `not_before` in `migrations/0001_init.sql`'s checkpoints
+  table. Errors returned as plain text under HTTP 200 are treated as
+  failures, as is any non-JSON body.
+- Inserts are idempotent (`INSERT OR IGNORE` on `(question_id, url)`),
+  and every firing leaves an audit row in the `runs` table. The Worker
+  also serves a read-only JSON health view of counts and recent runs.
+
+Layout:
+
+- `cloudflare.config.ts` — the `cf` CLI project config (Worker name,
+  D1 binding `DB` → database `radar-gdelt`, cron trigger `*/10 * * * *`).
+- `src/index.ts` — the collector (question queries are v1 keyword sets,
+  tuned by the observed run counts).
+- `migrations/` — the D1 schema.
+
+Tooling: the `cf` CLI (Cloudflare's official agentic CLI, beta) is the
+primary tool, pinned exactly in `package.json`; `cf auth login` performs
+the browser OAuth sign-in. Deploy with `pnpm run deploy` after login.
