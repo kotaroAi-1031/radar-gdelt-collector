@@ -1,0 +1,15 @@
+# Common Git hooks for every repository Muse creates.
+# Blocks commits and pushes that contain secrets, using Betterleaks
+# (the successor to gitleaks, by the same author; drop-in compatible).
+# Requires lefthook and betterleaks on PATH (~/workspace/tools/bin, mirrored to /usr/local/bin).
+# After cloning or copying this file into a repo, run: lefthook install
+
+pre-commit:
+  commands:
+    betterleaks:
+      run: betterleaks git --pre-commit --staged --redact --verbose
+
+pre-push:
+  commands:
+    betterleaks:
+      run: betterleaks git --redact --verbose

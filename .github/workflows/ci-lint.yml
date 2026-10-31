@@ -1,0 +1,183 @@
+name: CI Lint
+
+# Hardened workflow linting:
+# - Top-level permissions are empty ({}); every job declares exactly
+#   the permissions it needs (contents: read for all jobs here), and
+#   no job gets a write token.
+# - Every action is pinned to a full commit SHA (Dependabot keeps them current).
+# - Tool versions are managed by the repository flake: flake.lock pins
+#   the nixpkgs revision, and the custom tool derivations in flake.nix
+#   pin the official release artifacts by SHA-256 (fixed-output
+#   fetches, verified by Nix). Jobs install Nix with the pinned
+#   installer action and pull exactly the tools they need via
+#   `nix shell`.
+# - Tool install steps never use untrusted event data in `run:` scripts.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Cancel superseded runs for pull requests only; runs triggered by
+  # pushes to main always finish, so a merged change is never left
+  # half-checked.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  jactionlint:
+    name: jactionlint (pedantic, all rules, with shellcheck and pyflakes)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        timeout-minutes: 5
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      # jactionlint is a fork of actionlint that covers all of actionlint's
+      # checks plus zizmor-style security rules. It enables its shellcheck
+      # and pyflakes integrations automatically when those binaries are on
+      # PATH, so provide all three. CI runs the strictest profile
+      # (pedantic) with --strict-exit, offline (no --online checks).
+      - name: Run jactionlint (strictest profile, all rules, offline)
+        timeout-minutes: 20
+        run: nix shell .#jactionlint .#shellcheck .#pyflakes --command jactionlint --profile pedantic --strict-exit --verbose
+
+  sisakulint:
+    name: sisakulint (GitHub Actions SAST, non-duplicate rules)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        timeout-minutes: 5
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      # sisakulint runs with every rule enabled EXCEPT the ones that
+      # duplicate a jactionlint rule (jactionlint runs in the job above
+      # at the pedantic profile, offline). Each ignored rule below is
+      # listed with the jactionlint rule that covers it:
+      #   commit-sha                     -> unpinned-uses
+      #   unpinned-images                -> unpinned-images / unpinned-uses
+      #   permissions                    -> excessive-permissions,
+      #                                     missing-permissions,
+      #                                     invalid-permissions
+      #   artipacked                     -> artipacked
+      #   cache-poisoning                -> cache-poisoning
+      #   cache-poisoning-poisonable-step -> cache-poisoning (pedantic)
+      #   dangerous-triggers-critical    -> dangerous-triggers
+      #   dangerous-triggers-medium      -> dangerous-triggers
+      #   deprecated-commands            -> deprecated-commands
+      #   deprecated-node-runtime        -> deprecated-node-runtime
+      #   bot-conditions                 -> bot-conditions
+      #   argument-injection             -> argument-injection
+      #   untrusted-checkout             -> untrusted-checkout
+      #   timeout-minutes                -> missing-timeout (job level;
+      #                                     the step-level opt-in
+      #                                     missing-timeout-minutes has no
+      #                                     jactionlint equivalent and
+      #                                     stays enabled below)
+      #   dependabot-github-actions      -> dependabot-missing-actions-update
+      #   secrets-inherit                -> secrets-inherit
+      #   unsound-contains               -> unsound-contains
+      #   self-hosted-runners            -> self-hosted-runner
+      #   output-clobbering              -> output-clobbering
+      #   needs                          -> duplicate-job-needs,
+      #                                     undefined-job-needs,
+      #                                     cyclic-job-needs
+      #   id                             -> invalid-id
+      #   environment-variable           -> invalid-env-var-name
+      #   conditional                    -> if-always-true
+      #   workflow-call                  -> invalid-workflow-call and the
+      #                                     other workflow-call checks
+      #   expression                     -> expression-syntax,
+      #                                     expression-type
+      # Everything else sisakulint offers stays ON, in particular its
+      # taint-propagation / dataflow rules (code-injection-*,
+      # envvar-injection-*, envpath-injection-*, reusable-workflow-taint,
+      # secret-exfiltration, untrusted-checkout-toctou-*) and the rules
+      # whose jactionlint counterparts only run with --online, which CI
+      # does not use (impostor-commit, archived-uses,
+      # known-vulnerable-actions, ref-confusion).
+      - name: Run sisakulint
+        timeout-minutes: 20
+        run: >-
+          nix shell .#sisakulint --command sisakulint -enable-rule missing-timeout-minutes
+          -ignore "^(commit-sha|unpinned-images|permissions|artipacked|cache-poisoning|cache-poisoning-poisonable-step|dangerous-triggers-critical|dangerous-triggers-medium|deprecated-commands|deprecated-node-runtime|bot-conditions|argument-injection|untrusted-checkout|timeout-minutes|dependabot-github-actions|secrets-inherit|unsound-contains|self-hosted-runners|output-clobbering)$"
+          -ignore "^(needs|id|environment-variable|conditional|workflow-call|expression)$"
+
+  betterleaks:
+    name: betterleaks (secret scan)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Nix
+        timeout-minutes: 5
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Scan git history for secrets
+        timeout-minutes: 20
+        run: nix shell .#betterleaks --command betterleaks git --redact --verbose .
+
+  typecheck:
+    name: typecheck (tsrs, experimental)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        timeout-minutes: 5
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      # Typecheck the infra/ Alchemy program with tsrs, the Rust port
+      # of the TypeScript 7 compiler (a checker only; the program
+      # itself still runs on Node). tsrs is experimental (beta), so
+      # this job is intentionally NOT one of the ruleset's required
+      # status checks: it reports, it does not gate merges.
+      # Node and pnpm come from the repository flake (see flake.nix).
+      - name: Install infra dependencies
+        timeout-minutes: 15
+        run: nix shell .#nodejs_26 .#pnpm --command pnpm --dir infra install --frozen-lockfile
+
+      - name: Typecheck infra with tsrs
+        timeout-minutes: 10
+        run: nix shell .#nodejs_26 .#pnpm --command pnpm --dir infra run typecheck

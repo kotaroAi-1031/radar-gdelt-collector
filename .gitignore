@@ -1,0 +1,26 @@
+# Secrets and credentials: never commit these.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+credentials*
+*secret*
+.aws/
+.gnupg/
+.netrc
+
+# OS and editor noise
+.DS_Store
+*.swp
+
+# Build and dependency output
+node_modules/
+__pycache__/
+dist/
+
+# Alchemy local state (infra/)
+.alchemy/

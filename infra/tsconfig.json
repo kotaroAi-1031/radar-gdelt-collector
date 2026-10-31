@@ -1,0 +1,19 @@
+{
+  // Hand-written: tsrs (like tsc) reads this file, but its --init and
+  // --showConfig are not supported yet, so the config is maintained by
+  // hand. Options mirror how alchemy.run.ts is executed: Node.js 24
+  // runs the TypeScript file directly (type stripping), so NodeNext
+  // module/resolution semantics apply.
+  "compilerOptions": {
+    "target": "ES2024",
+    "lib": ["ES2024"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true
+  },
+  "include": ["alchemy.run.ts"]
+}

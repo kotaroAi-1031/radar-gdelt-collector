@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/jdx/jactionlint/main/schema/jactionlint-config.json
+# jactionlint project configuration. CI runs with --profile pedantic,
+# which overrides any profile set here; this file exists to calibrate
+# one rule to a deliberate policy choice:
+#
+# The dependabot-cooldown rule's built-in floor ("days") for
+# cooldown.default-days is 7 days. The policy chosen for these
+# repositories is 3 days (with 7 days for semver-major bumps), so the
+# rule's floor is set to the chosen value. The rule stays enabled and
+# still fails the build for anything below 3 days.
+rules:
+  dependabot-cooldown:
+    days: 3

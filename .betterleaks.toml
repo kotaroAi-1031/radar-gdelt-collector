@@ -1,0 +1,106 @@
+title = "Muse common betterleaks config"
+
+# Maximally strict secret scanning.
+#
+# Layer 1: the full built-in default rule set of betterleaks v1.9.0
+# (all 463 rules; verified against config/betterleaks.toml in the
+# betterleaks v1.9.0 source tree -- useDefault loads every one of them,
+# there is no opt-in rule pack or experiment flag that adds more).
+#
+# Layer 2: supplementary rules below for high-value patterns that the
+# v1.9.0 default set verifiably does NOT cover:
+#   - square-secret / trello-access-token: rule constructors exist in the
+#     upstream source (cmd/generate/config/rules/) but were never wired
+#     into the generated default config.
+#   - google-oauth-client-secret (GOCSPX-): only appears inside an ADC
+#     sample in upstream; no standalone rule.
+#   - anthropic-oauth-token (sk-ant-oat01-): default anthropic-api-key
+#     only matches sk-ant-api03-.
+#   - doppler-extended-token: default doppler-api-token only matches
+#     the personal token prefix dp.pt.; service/CLI/SCIM/audit token
+#     prefixes (dp.st. / dp.ct. / dp.scim. / dp.audit.) are uncovered.
+#   - infisical-service-token: no Infisical rule exists upstream at all.
+#   - generic-high-entropy-assignment: the default generic rules are
+#     precision-tuned (confidence "low", heavy false-positive filters);
+#     this adds an assignment-anchored catch for long random-looking
+#     values whose Shannon entropy is above 4.5 (pure hex tops out at
+#     ~4.0, so git SHAs and checksums do not trip it).
+#
+# Rule IDs below were checked against the default set: none collide
+# (a duplicate ID would make the config invalid).
+
+[extend]
+useDefault = true
+
+# --- Square OAuth client secret (upstream rule, not in defaults) ---
+[[rules]]
+id = "square-secret"
+description = "Detected a Square OAuth client secret, potentially compromising Square application integrations."
+regex = '''sq0csp-[\w-]{43}'''
+keywords = ["sq0csp-"]
+confidence = "high"
+
+# --- Trello access token (upstream rule, not in defaults) ---
+# Semi-generic: requires a "trello" keyword context, mirroring the
+# upstream definition (keyword + 32-char token), plus an entropy floor.
+[[rules]]
+id = "trello-access-token"
+description = "Detected a Trello access token in a trello-keyed assignment, potentially compromising Trello boards and workspaces."
+regex = '''(?i)(?:trello)(?:[\w.\-=]{0,20})(?:[\s'"]{0,3})(?:=|>|:{1,3}=|\|\|:|=>|\?=|,)(?:[\x60'"\s=]{0,5})([A-Za-z0-9_\-]{32})(?:[\s'"\x60;,]|$)'''
+secretGroup = 1
+keywords = ["trello"]
+confidence = "medium"
+filter = '''
+entropy(finding["secret"]) <= 3.0
+'''
+
+# --- Google OAuth client secret (GOCSPX-) ---
+[[rules]]
+id = "google-oauth-client-secret"
+description = "Detected a Google OAuth client secret (GOCSPX-), potentially compromising Google sign-in integrations."
+regex = '''\bGOCSPX-[A-Za-z0-9_\-]{28}\b'''
+keywords = ["gocspx"]
+confidence = "high"
+
+# --- Anthropic OAuth token (Claude Code style, sk-ant-oat01-) ---
+[[rules]]
+id = "anthropic-oauth-token"
+description = "Detected an Anthropic OAuth token (sk-ant-oat01-), potentially compromising Anthropic account access via OAuth-based tooling."
+regex = '''\bsk-ant-oat01-[A-Za-z0-9_\-]{40,120}'''
+keywords = ["sk-ant-oat01"]
+confidence = "high"
+
+# --- Doppler service / CLI / SCIM / audit tokens ---
+# Default doppler-api-token covers only dp.pt. (personal tokens).
+[[rules]]
+id = "doppler-extended-token"
+description = "Detected a Doppler service, CLI, SCIM, or audit token, posing a risk to environment and secrets management security."
+regex = '''dp\.(?:st|ct|scim|audit)\.[A-Za-z0-9][A-Za-z0-9._\-]{20,90}'''
+keywords = ["dp.st.", "dp.ct.", "dp.scim.", "dp.audit."]
+confidence = "high"
+
+# --- Infisical service token (legacy st. format) ---
+[[rules]]
+id = "infisical-service-token"
+description = "Detected an Infisical service token, potentially compromising secrets stored in Infisical projects."
+regex = '''\bst\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b'''
+keywords = ["st."]
+confidence = "medium"
+filter = '''
+entropy(finding["secret"]) <= 3.0
+'''
+
+# --- Generic high-entropy assignment (supplements the default generics) ---
+# Keyword-anchored assignment whose value is a long mixed-charset string
+# with Shannon entropy above 4.5. Values such as ${{ ... }} template
+# expressions do not match the value charset and stay clean.
+[[rules]]
+id = "generic-high-entropy-assignment"
+description = "Detected a high-entropy string assigned to a secret-like key, potentially exposing a credential for an unknown or custom service."
+regex = '''(?i)(?:client[_-]?secret|api[_-]?key|apikey|secret|token|passwd|password|auth[_-]?key|private[_-]?key)(?:[ \t\w.\-]{0,20})[\s'"]{0,3}(?:=|:=|:)(?:[\x60'"\s=]{0,5})([A-Za-z0-9+/][A-Za-z0-9+/=_\-]{23,127})'''
+secretGroup = 1
+keywords = ["secret", "token", "key", "password", "passwd", "auth"]
+confidence = "medium"
+filter = '''
+entropy(finding["secret"]) <= 4.5
+'''
