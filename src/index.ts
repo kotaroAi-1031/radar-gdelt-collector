@@ -8,10 +8,15 @@
 // sleeping or hammering: a failed firing simply defers that question.
 //
 // Collection and reporting are separate by construction: this Worker only
-// writes to D1; the radar's daily update reads from D1.
+// writes to Turso (libSQL). The radar's daily update reads a locally synced
+// replica (Turso embedded replica / sync), so reporting never depends on
+// the GDELT API or on Cloudflare being reachable at report time.
+
+import { createClient, type Client } from "@libsql/client/web";
 
 interface Env {
-  DB: D1Database;
+  TURSO_DATABASE_URL: string;
+  TURSO_AUTH_TOKEN: string;
 }
 
 interface Question {
@@ -51,34 +56,38 @@ function docDatetime(unixSec: number): string {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
 }
 
-async function loadCheckpoint(db: D1Database, questionId: string): Promise<Checkpoint> {
-  const row = await db
-    .prepare("SELECT next_start, pending, not_before FROM checkpoints WHERE question_id = ?")
-    .bind(questionId)
-    .first<{ next_start: number | null; pending: string; not_before: number }>();
+async function loadCheckpoint(db: Client, questionId: string): Promise<Checkpoint> {
+  const rs = await db.execute({
+    sql: "SELECT next_start, pending, not_before FROM checkpoints WHERE question_id = ?",
+    args: [questionId],
+  });
+  const row = rs.rows[0];
   if (!row) return { next_start: null, pending: [], not_before: 0 };
   let pending: [number, number][] = [];
   try {
-    const parsed = JSON.parse(row.pending);
+    const parsed = JSON.parse(String(row.pending));
     if (Array.isArray(parsed)) pending = parsed as [number, number][];
   } catch {
     pending = [];
   }
-  return { next_start: row.next_start, pending, not_before: row.not_before };
+  return {
+    next_start: row.next_start === null ? null : Number(row.next_start),
+    pending,
+    not_before: Number(row.not_before),
+  };
 }
 
-async function saveCheckpoint(db: D1Database, questionId: string, cp: Checkpoint): Promise<void> {
-  await db
-    .prepare(
+async function saveCheckpoint(db: Client, questionId: string, cp: Checkpoint): Promise<void> {
+  await db.execute({
+    sql:
       "INSERT INTO checkpoints (question_id, next_start, pending, not_before, updated_at) VALUES (?, ?, ?, ?, ?) " +
-        "ON CONFLICT(question_id) DO UPDATE SET next_start = excluded.next_start, pending = excluded.pending, not_before = excluded.not_before, updated_at = excluded.updated_at",
-    )
-    .bind(questionId, cp.next_start, JSON.stringify(cp.pending), cp.not_before, new Date().toISOString())
-    .run();
+      "ON CONFLICT(question_id) DO UPDATE SET next_start = excluded.next_start, pending = excluded.pending, not_before = excluded.not_before, updated_at = excluded.updated_at",
+    args: [questionId, cp.next_start, JSON.stringify(cp.pending), cp.not_before, new Date().toISOString()],
+  });
 }
 
 async function logRun(
-  db: D1Database,
+  db: Client,
   questionId: string,
   windowStart: number | null,
   windowEnd: number | null,
@@ -86,23 +95,23 @@ async function logRun(
   inserted: number | null,
   status: string,
 ): Promise<void> {
-  await db
-    .prepare("INSERT INTO runs (at, question_id, window_start, window_end, returned, inserted, status) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(new Date().toISOString(), questionId, windowStart, windowEnd, returned, inserted, status)
-    .run();
+  await db.execute({
+    sql: "INSERT INTO runs (at, question_id, window_start, window_end, returned, inserted, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    args: [new Date().toISOString(), questionId, windowStart, windowEnd, returned, inserted, status],
+  });
 }
 
-async function collect(db: D1Database): Promise<void> {
+async function collect(db: Client): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
 
   // Rotate across questions: one question per firing.
-  const metaRow = await db.prepare("SELECT value FROM meta WHERE key = 'rotation'").first<{ value: string }>();
-  const rotation = metaRow ? Number.parseInt(metaRow.value, 10) || 0 : 0;
+  const metaRs = await db.execute({ sql: "SELECT value FROM meta WHERE key = 'rotation'", args: [] });
+  const rotation = metaRs.rows[0] ? Number.parseInt(String(metaRs.rows[0].value), 10) || 0 : 0;
   const question = QUESTIONS[rotation % QUESTIONS.length];
-  await db
-    .prepare("INSERT INTO meta (key, value) VALUES ('rotation', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .bind(String(rotation + 1))
-    .run();
+  await db.execute({
+    sql: "INSERT INTO meta (key, value) VALUES ('rotation', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    args: [String(rotation + 1)],
+  });
 
   const cp = await loadCheckpoint(db, question.id);
 
@@ -190,11 +199,9 @@ async function collect(db: D1Database): Promise<void> {
       .filter((a) => typeof a.url === "string" && a.url.length > 0)
       .map((a) => {
         const toneNum = typeof a.tone === "number" ? a.tone : Number(a.tone);
-        return db
-          .prepare(
-            "INSERT OR IGNORE INTO articles (question_id, url, seendate, title, domain, language, source_country, tone, social_image, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          )
-          .bind(
+        return {
+          sql: "INSERT OR IGNORE INTO articles (question_id, url, seendate, title, domain, language, source_country, tone, social_image, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          args: [
             question.id,
             a.url as string,
             typeof a.seendate === "string" ? a.seendate : null,
@@ -205,11 +212,12 @@ async function collect(db: D1Database): Promise<void> {
             Number.isFinite(toneNum) ? toneNum : null,
             typeof a.socialimage === "string" ? a.socialimage : null,
             fetchedAt,
-          );
+          ],
+        };
       });
     if (statements.length > 0) {
-      const results = await db.batch(statements);
-      inserted = results.reduce((sum, r) => sum + (r.meta?.changes ?? 0), 0);
+      const results = await db.batch(statements, "write");
+      inserted = results.reduce((sum, r) => sum + (r.rowsAffected ?? 0), 0);
     }
   }
 
@@ -231,23 +239,36 @@ async function collect(db: D1Database): Promise<void> {
   );
 }
 
+function clientFromEnv(env: Env): Client {
+  return createClient({ url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN });
+}
+
 export default {
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(collect(env.DB));
+    ctx.waitUntil(collect(clientFromEnv(env)));
   },
 
   // Read-only health view: per-question counts and the latest runs.
   async fetch(_request: Request, env: Env): Promise<Response> {
-    const counts = await env.DB
-      .prepare("SELECT question_id, COUNT(*) AS n FROM articles GROUP BY question_id ORDER BY question_id")
-      .all<{ question_id: string; n: number }>();
-    const runs = await env.DB
-      .prepare("SELECT at, question_id, returned, inserted, status FROM runs ORDER BY id DESC LIMIT 10")
-      .all<{ at: string; question_id: string; returned: number | null; inserted: number | null; status: string }>();
+    const db = clientFromEnv(env);
+    const counts = await db.execute({
+      sql: "SELECT question_id, COUNT(*) AS n FROM articles GROUP BY question_id ORDER BY question_id",
+      args: [],
+    });
+    const runs = await db.execute({
+      sql: "SELECT at, question_id, returned, inserted, status FROM runs ORDER BY id DESC LIMIT 10",
+      args: [],
+    });
     return Response.json({
       ok: true,
-      articlesByQuestion: counts.results ?? [],
-      recentRuns: runs.results ?? [],
+      articlesByQuestion: counts.rows.map((r) => ({ question_id: String(r.question_id), n: Number(r.n) })),
+      recentRuns: runs.rows.map((r) => ({
+        at: String(r.at),
+        question_id: String(r.question_id),
+        returned: r.returned === null ? null : Number(r.returned),
+        inserted: r.inserted === null ? null : Number(r.inserted),
+        status: String(r.status),
+      })),
     });
   },
 } satisfies ExportedHandler<Env>;

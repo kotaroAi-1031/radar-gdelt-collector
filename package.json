@@ -12,5 +12,8 @@
     "deploy": "cf deploy",
     "typecheck": "tsc --noEmit"
   },
-  "packageManager": "pnpm@12.16.1"
+  "packageManager": "pnpm@12.16.1",
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
+  }
 }
