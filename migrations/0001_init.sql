@@ -1,4 +1,7 @@
--- GDELT collector schema (D1 / SQLite).
+-- GDELT collector schema (Turso / SQLite). Applied to every question
+-- database (radar-gdelt-q1 ... q6); each database holds exactly one
+-- question's rows, so question_id is constant within a database and the
+-- fleet is migrated by running this file against each database.
 -- articles: one row per (question, article URL). INSERT OR IGNORE keeps
 -- re-collection idempotent; the primary key is the dedupe contract.
 CREATE TABLE IF NOT EXISTS articles (
@@ -27,12 +30,6 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   pending TEXT NOT NULL DEFAULT '[]',
   not_before INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT
-);
-
--- meta: small key/value store (rotation pointer across the questions).
-CREATE TABLE IF NOT EXISTS meta (
-  key TEXT PRIMARY KEY,
-  value TEXT
 );
 
 -- runs: audit log of every collection firing, including skips and splits.

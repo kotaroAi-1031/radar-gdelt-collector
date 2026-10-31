@@ -82,20 +82,26 @@ GITHUB_REPO="kotaroAi-1031/<new-repo>" pnpm run apply
 # radar-gdelt-collector (this repository's project)
 
 A GDELT collector for the primary information radar, built on the
-template above. It runs on **Cloudflare Workers Free only** and stores
-what it collects in **Turso** (libSQL); the radar's daily update reads a
-locally synced replica (Turso sync / embedded replica) and never calls
-the public GDELT API itself (collection and reporting are separate
-tasks by design). Storage was deliberately placed outside Cloudflare so
-that reporting keeps working even when an upstream API or Cloudflare
-itself is unreachable.
+template above. It runs on **Cloudflare Workers Free only**. Following
+Turso's many-database model, there is no shared database: each of the
+radar's six watch questions owns its own Turso database
+(`radar-gdelt-q1` … `radar-gdelt-q6`), and this Worker writes only to
+the database of the question it is collecting for. Integration across
+questions is a read-side concern — the radar's daily update pulls each
+database to the VM with Turso Sync and composes the unified view
+locally, where the integrated store is derived data that can be
+rebuilt from the per-question sources at any time. Storage lives
+outside Cloudflare so that reporting keeps working even when an
+upstream API or Cloudflare itself is unreachable.
 
 How it collects, following measured practice for the GDELT DOC 2.0 API
 (see `src/index.ts` for the implementation):
 
 - A cron firing handles **one watch question and one time window**, so a
-  firing stays far inside the Free plan's 10 ms CPU budget. Six questions
-  rotate across firings every 10 minutes.
+  firing stays far inside the Free plan's 10 ms CPU budget. Which
+  question a firing serves is derived statelessly from the scheduled
+  time (10-minute slots rotating over the six questions), so no shared
+  coordination state exists anywhere.
 - The DOC API returns at most 250 articles per query with no pagination.
   When a window comes back saturated, it is **split in half and the
   halves are queued** in the checkpoint state — the time window is the
@@ -115,11 +121,13 @@ Layout:
 
 - `cloudflare.config.ts` — the `cf` CLI project config (Worker name,
   cron trigger `*/10 * * * *`). There is no storage binding: the Worker
-  connects to Turso with the `TURSO_DATABASE_URL` and
-  `TURSO_AUTH_TOKEN` secrets.
+  connects to the per-question Turso databases with the single
+  `TURSO_DATABASES_JSON` secret, a JSON map of question id to
+  `{ url, authToken }` (each token scoped to its own database).
 - `src/index.ts` — the collector (question queries are v1 keyword sets,
   tuned by the observed run counts).
-- `migrations/` — the database schema (applied to Turso).
+- `migrations/` — the database schema, applied to every question
+  database (a fleet operation of six, scripted once).
 
 Tooling: the `cf` CLI (Cloudflare's official agentic CLI, beta) is the
 primary tool, pinned exactly in `package.json`; `cf auth login` performs

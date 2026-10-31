@@ -1,22 +1,31 @@
 // GDELT collector for the primary information radar.
 //
-// Design (see README.md): one firing handles exactly one question and one
-// time window, so a firing stays tiny on the Workers Free plan (10 ms CPU).
-// The DOC API's 250-record cap is handled by splitting saturated windows in
-// half and queuing the halves in the checkpoint state — the time window is
-// the pagination. Rate limits are handled as state (`not_before`), never by
-// sleeping or hammering: a failed firing simply defers that question.
+// Topology (Turso's many-database model): there is no shared database.
+// Each watch question owns its own Turso database (radar-gdelt-q1 … q6),
+// and this Worker writes only to the database of the question it is
+// collecting for. Integration across questions is a read-side concern:
+// the radar's daily update pulls each database to the VM and composes
+// the unified view locally, where the integrated store is derived data
+// that can be rebuilt from the per-question sources at any time.
 //
-// Collection and reporting are separate by construction: this Worker only
-// writes to Turso (libSQL). The radar's daily update reads a locally synced
-// replica (Turso embedded replica / sync), so reporting never depends on
-// the GDELT API or on Cloudflare being reachable at report time.
+// Design (see README.md): one firing handles exactly one question and one
+// time window, so a firing stays tiny on the Workers Free plan (10 ms
+// CPU). Which question a firing serves is derived statelessly from the
+// scheduled time (10-minute slots rotating over the questions), so no
+// shared coordination state exists anywhere. The DOC API's 250-record
+// cap is handled by splitting saturated windows in half and queuing the
+// halves in the question's own checkpoint table — the time window is the
+// pagination. Rate limits are handled as state (`not_before`), never by
+// sleeping or hammering: a failed firing simply defers that question.
 
 import { createClient, type Client } from "@libsql/client/web";
 
 interface Env {
-  TURSO_DATABASE_URL: string;
-  TURSO_AUTH_TOKEN: string;
+  // One secret holding every question database's credentials:
+  // { "q1": { "url": "libsql://…", "authToken": "…" }, … }
+  // Each token is scoped to its own database; the JSON wrapper only keeps
+  // deployment to a single secret.
+  TURSO_DATABASES_JSON: string;
 }
 
 interface Question {
@@ -43,11 +52,24 @@ const MAX_WINDOW_SEC = 6 * 3600; // a frontier window covers at most 6 hours
 const FIRST_WINDOW_SEC = 2 * 3600; // first run for a question looks back 2 hours
 const MAX_AGE_SEC = 89 * 86400; // the DOC index covers roughly the last 3 months
 const BACKOFF_SEC = 15 * 60; // matches the ~15 min IP block seen in practice
+const SLOT_SEC = 600; // cron fires every 10 minutes; one question per slot
 
 interface Checkpoint {
   next_start: number | null;
   pending: [number, number][];
   not_before: number;
+}
+
+type DatabaseConfig = Record<string, { url: string; authToken: string }>;
+let cachedConfig: DatabaseConfig | null = null;
+
+function clientFor(env: Env, questionId: string): Client {
+  if (!cachedConfig) {
+    cachedConfig = JSON.parse(env.TURSO_DATABASES_JSON) as DatabaseConfig;
+  }
+  const cfg = cachedConfig[questionId];
+  if (!cfg) throw new Error(`no database configured for ${questionId}`);
+  return createClient({ url: cfg.url, authToken: cfg.authToken });
 }
 
 function docDatetime(unixSec: number): string {
@@ -101,18 +123,8 @@ async function logRun(
   });
 }
 
-async function collect(db: Client): Promise<void> {
+async function collect(db: Client, question: Question): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
-
-  // Rotate across questions: one question per firing.
-  const metaRs = await db.execute({ sql: "SELECT value FROM meta WHERE key = 'rotation'", args: [] });
-  const rotation = metaRs.rows[0] ? Number.parseInt(String(metaRs.rows[0].value), 10) || 0 : 0;
-  const question = QUESTIONS[rotation % QUESTIONS.length];
-  await db.execute({
-    sql: "INSERT INTO meta (key, value) VALUES ('rotation', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    args: [String(rotation + 1)],
-  });
-
   const cp = await loadCheckpoint(db, question.id);
 
   if (now < cp.not_before) {
@@ -239,36 +251,44 @@ async function collect(db: Client): Promise<void> {
   );
 }
 
-function clientFromEnv(env: Env): Client {
-  return createClient({ url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN });
-}
-
 export default {
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(collect(clientFromEnv(env)));
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Stateless rotation: the 10-minute slot number picks the question, so
+    // every question is served once per hour with no shared state.
+    const slot = Math.floor(controller.scheduledTime / (SLOT_SEC * 1000));
+    const question = QUESTIONS[slot % QUESTIONS.length];
+    ctx.waitUntil(collect(clientFor(env, question.id), question));
   },
 
-  // Read-only health view: per-question counts and the latest runs.
+  // Read-only health view across all question databases.
   async fetch(_request: Request, env: Env): Promise<Response> {
-    const db = clientFromEnv(env);
-    const counts = await db.execute({
-      sql: "SELECT question_id, COUNT(*) AS n FROM articles GROUP BY question_id ORDER BY question_id",
-      args: [],
-    });
-    const runs = await db.execute({
-      sql: "SELECT at, question_id, returned, inserted, status FROM runs ORDER BY id DESC LIMIT 10",
-      args: [],
-    });
-    return Response.json({
-      ok: true,
-      articlesByQuestion: counts.rows.map((r) => ({ question_id: String(r.question_id), n: Number(r.n) })),
-      recentRuns: runs.rows.map((r) => ({
-        at: String(r.at),
-        question_id: String(r.question_id),
-        returned: r.returned === null ? null : Number(r.returned),
-        inserted: r.inserted === null ? null : Number(r.inserted),
-        status: String(r.status),
-      })),
-    });
+    const perQuestion = await Promise.all(
+      QUESTIONS.map(async (q) => {
+        try {
+          const db = clientFor(env, q.id);
+          const counts = await db.execute({
+            sql: "SELECT COUNT(*) AS n FROM articles",
+            args: [],
+          });
+          const runs = await db.execute({
+            sql: "SELECT at, returned, inserted, status FROM runs ORDER BY id DESC LIMIT 3",
+            args: [],
+          });
+          return {
+            question_id: q.id,
+            articles: Number(counts.rows[0]?.n ?? 0),
+            recentRuns: runs.rows.map((r) => ({
+              at: String(r.at),
+              returned: r.returned === null ? null : Number(r.returned),
+              inserted: r.inserted === null ? null : Number(r.inserted),
+              status: String(r.status),
+            })),
+          };
+        } catch (e) {
+          return { question_id: q.id, error: e instanceof Error ? e.message : String(e) };
+        }
+      }),
+    );
+    return Response.json({ ok: true, perQuestion });
   },
 } satisfies ExportedHandler<Env>;
