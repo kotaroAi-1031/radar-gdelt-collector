@@ -158,6 +158,15 @@ async function handleFailure(
     cp.fail_count = 1;
   }
 
+  // Pin a fresh frontier window: while next_start is unset, the window is
+  // derived from `now` at each attempt and slides, so the failure identity
+  // above would never match twice and the count would never accumulate.
+  // Persisting the start makes the retry target the same window. (When
+  // the split below fires, it overwrites next_start with the window end.)
+  if (!fromPending && cp.next_start === null) {
+    cp.next_start = start;
+  }
+
   let status = httpStatus === 429 ? "rate_limited" : "bad_response";
   if (cp.fail_count >= FAIL_SPLIT_THRESHOLD && end - start > MIN_WINDOW_SEC) {
     const mid = start + Math.floor((end - start) / 2);
@@ -201,7 +210,11 @@ async function collect(db: Client, question: Question): Promise<void> {
     // chronologically, with split windows interleaved, until it reaches
     // the present and settles into steady-state monitoring.
     start = cp.next_start ?? now - MAX_AGE_SEC;
-    start = Math.max(start, now - MAX_AGE_SEC);
+    // A pinned frontier start (persisted after a failure, see
+    // handleFailure) is used verbatim so the retried window is identical
+    // and its failures accumulate toward a split. Only a start that has
+    // fallen more than one window behind the DOC horizon is clamped.
+    if (start < now - MAX_AGE_SEC - MAX_WINDOW_SEC) start = now - MAX_AGE_SEC;
     if (end - start > MAX_WINDOW_SEC) end = start + MAX_WINDOW_SEC;
     if (start >= end) {
       await logRun(db, question.id, start, end, 0, 0, "idle");
