@@ -116,6 +116,11 @@ How it collects, following measured practice for the GDELT DOC 2.0 API
   minutes via `not_before` in `migrations/0001_init.sql`'s checkpoints
   table. Errors returned as plain text under HTTP 200 are treated as
   failures, as is any non-JSON body.
+- A window that fails repeatedly is split too: after 3 consecutive
+  failures of the same window, it is halved and the halves are queued
+  (`migrations/0002_failure_split.sql`), so a query GDELT refuses
+  outright for being too heavy cannot stall its question forever. Every
+  run row records the HTTP status, so failures stay diagnosable.
 - Inserts are idempotent (`INSERT OR IGNORE` on `(question_id, url)`),
   and every firing leaves an audit row in the `runs` table. The Worker
   also serves a read-only JSON health view of counts and recent runs.

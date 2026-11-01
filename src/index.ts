@@ -17,7 +17,10 @@
 // settling into steady-state monitoring. The DOC API's 250-record
 // cap is handled by splitting saturated windows in half and queuing the
 // halves in the question's own checkpoint table — the time window is the
-// pagination. Rate limits are handled as state (`not_before`), never by
+// pagination. A window that keeps failing (a heavy query that GDELT
+// refuses outright behaves this way) is split the same way after repeated
+// failures, so one unanswerable window can never stall a question
+// forever. Rate limits are handled as state (`not_before`), never by
 // sleeping or hammering: a failed firing simply defers that question.
 
 import { createClient, type Client } from "@libsql/client/web";
@@ -54,11 +57,15 @@ const MAX_WINDOW_SEC = 6 * 3600; // a frontier window covers at most 6 hours
 const MAX_AGE_SEC = 89 * 86400; // the DOC index covers roughly the last 3 months
 const BACKOFF_SEC = 15 * 60; // matches the ~15 min IP block seen in practice
 const SLOT_SEC = 60; // cron fires every minute; one question per slot
+const FAIL_SPLIT_THRESHOLD = 3; // consecutive failures of one window before it is split
 
 interface Checkpoint {
   next_start: number | null;
   pending: [number, number][];
   not_before: number;
+  fail_start: number | null;
+  fail_end: number | null;
+  fail_count: number;
 }
 
 type DatabaseConfig = Record<string, { url: string; authToken: string }>;
@@ -81,11 +88,11 @@ function docDatetime(unixSec: number): string {
 
 async function loadCheckpoint(db: Client, questionId: string): Promise<Checkpoint> {
   const rs = await db.execute({
-    sql: "SELECT next_start, pending, not_before FROM checkpoints WHERE question_id = ?",
+    sql: "SELECT next_start, pending, not_before, fail_start, fail_end, fail_count FROM checkpoints WHERE question_id = ?",
     args: [questionId],
   });
   const row = rs.rows[0];
-  if (!row) return { next_start: null, pending: [], not_before: 0 };
+  if (!row) return { next_start: null, pending: [], not_before: 0, fail_start: null, fail_end: null, fail_count: 0 };
   let pending: [number, number][] = [];
   try {
     const parsed = JSON.parse(String(row.pending));
@@ -94,18 +101,21 @@ async function loadCheckpoint(db: Client, questionId: string): Promise<Checkpoin
     pending = [];
   }
   return {
-    next_start: row.next_start === null ? null : Number(row.next_start),
+    next_start: row.next_start == null ? null : Number(row.next_start),
     pending,
     not_before: Number(row.not_before),
+    fail_start: row.fail_start == null ? null : Number(row.fail_start),
+    fail_end: row.fail_end == null ? null : Number(row.fail_end),
+    fail_count: row.fail_count == null ? 0 : Number(row.fail_count),
   };
 }
 
 async function saveCheckpoint(db: Client, questionId: string, cp: Checkpoint): Promise<void> {
   await db.execute({
     sql:
-      "INSERT INTO checkpoints (question_id, next_start, pending, not_before, updated_at) VALUES (?, ?, ?, ?, ?) " +
-      "ON CONFLICT(question_id) DO UPDATE SET next_start = excluded.next_start, pending = excluded.pending, not_before = excluded.not_before, updated_at = excluded.updated_at",
-    args: [questionId, cp.next_start, JSON.stringify(cp.pending), cp.not_before, new Date().toISOString()],
+      "INSERT INTO checkpoints (question_id, next_start, pending, not_before, fail_start, fail_end, fail_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(question_id) DO UPDATE SET next_start = excluded.next_start, pending = excluded.pending, not_before = excluded.not_before, fail_start = excluded.fail_start, fail_end = excluded.fail_end, fail_count = excluded.fail_count, updated_at = excluded.updated_at",
+    args: [questionId, cp.next_start, JSON.stringify(cp.pending), cp.not_before, cp.fail_start, cp.fail_end, cp.fail_count, new Date().toISOString()],
   });
 }
 
@@ -117,11 +127,55 @@ async function logRun(
   returned: number | null,
   inserted: number | null,
   status: string,
+  httpStatus: number | null = null,
 ): Promise<void> {
   await db.execute({
-    sql: "INSERT INTO runs (at, question_id, window_start, window_end, returned, inserted, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    args: [new Date().toISOString(), questionId, windowStart, windowEnd, returned, inserted, status],
+    sql: "INSERT INTO runs (at, question_id, window_start, window_end, returned, inserted, status, http_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    args: [new Date().toISOString(), questionId, windowStart, windowEnd, returned, inserted, status, httpStatus],
   });
+}
+
+// Handles one failed DOC call: backs the question off, and after
+// FAIL_SPLIT_THRESHOLD consecutive failures of the same window, splits the
+// window in half and queues the halves — the failure-driven twin of the
+// saturation split. Without this, a window GDELT refuses outright (too
+// heavy) is retried unchanged forever and the question stalls.
+async function handleFailure(
+  db: Client,
+  question: Question,
+  cp: Checkpoint,
+  start: number,
+  end: number,
+  fromPending: boolean,
+  httpStatus: number,
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  if (cp.fail_start === start && cp.fail_end === end) {
+    cp.fail_count += 1;
+  } else {
+    cp.fail_start = start;
+    cp.fail_end = end;
+    cp.fail_count = 1;
+  }
+
+  let status = httpStatus === 429 ? "rate_limited" : "bad_response";
+  if (cp.fail_count >= FAIL_SPLIT_THRESHOLD && end - start > MIN_WINDOW_SEC) {
+    const mid = start + Math.floor((end - start) / 2);
+    if (fromPending) {
+      cp.pending = [[start, mid], [mid, end], ...cp.pending.slice(1)];
+    } else {
+      cp.pending = [[start, mid], [mid, end], ...cp.pending];
+      cp.next_start = end;
+    }
+    cp.fail_start = null;
+    cp.fail_end = null;
+    cp.fail_count = 0;
+    status = "failed_split";
+  }
+
+  cp.not_before = now + BACKOFF_SEC;
+  await saveCheckpoint(db, question.id, cp);
+  await logRun(db, question.id, start, end, null, null, status, httpStatus > 0 ? httpStatus : null);
 }
 
 async function collect(db: Client, question: Question): Promise<void> {
@@ -180,9 +234,7 @@ async function collect(db: Client, question: Question): Promise<void> {
   // queries can be refused outright: anything that is not a JSON object is a
   // failed call. Defer this question instead of retrying inside the firing.
   if (httpStatus !== 200 || !bodyText.trimStart().startsWith("{")) {
-    cp.not_before = now + BACKOFF_SEC;
-    await saveCheckpoint(db, question.id, cp);
-    await logRun(db, question.id, start, end, null, null, httpStatus === 429 ? "rate_limited" : "bad_response");
+    await handleFailure(db, question, cp, start, end, fromPending, httpStatus);
     return;
   }
 
@@ -191,9 +243,7 @@ async function collect(db: Client, question: Question): Promise<void> {
     const data = JSON.parse(bodyText) as { articles?: Record<string, unknown>[] };
     if (Array.isArray(data.articles)) articles = data.articles;
   } catch {
-    cp.not_before = now + BACKOFF_SEC;
-    await saveCheckpoint(db, question.id, cp);
-    await logRun(db, question.id, start, end, null, null, "bad_response");
+    await handleFailure(db, question, cp, start, end, fromPending, httpStatus);
     return;
   }
 
@@ -204,8 +254,11 @@ async function collect(db: Client, question: Question): Promise<void> {
     const mid = start + Math.floor((end - start) / 2);
     const rest = fromPending ? cp.pending.slice(1) : cp.pending;
     cp.pending = [[start, mid], [mid, end], ...rest];
+    cp.fail_start = null;
+    cp.fail_end = null;
+    cp.fail_count = 0;
     await saveCheckpoint(db, question.id, cp);
-    await logRun(db, question.id, start, end, articles.length, 0, "split");
+    await logRun(db, question.id, start, end, articles.length, 0, "split", 200);
     return;
   }
 
@@ -244,6 +297,9 @@ async function collect(db: Client, question: Question): Promise<void> {
     cp.next_start = end;
   }
   cp.not_before = 0;
+  cp.fail_start = null;
+  cp.fail_end = null;
+  cp.fail_count = 0;
   await saveCheckpoint(db, question.id, cp);
   await logRun(
     db,
@@ -253,6 +309,7 @@ async function collect(db: Client, question: Question): Promise<void> {
     articles.length,
     inserted,
     articles.length >= MAX_RECORDS ? "ok_capped" : "ok",
+    200,
   );
 }
 
