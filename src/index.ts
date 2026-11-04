@@ -52,7 +52,7 @@ const QUESTIONS: Question[] = [
 const DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc";
 const USER_AGENT = "radar-gdelt-collector/0.1 (+https://github.com/kotaroAi-1031/radar-gdelt-collector)";
 const MAX_RECORDS = 250;
-const MIN_WINDOW_SEC = 1800; // never split below 30 minutes
+const MIN_WINDOW_SEC = 2700; // GDELT rejects shorter timespans outright ("Timespan is too short.", HTTP 200 text); 45 min is the smallest window size observed to succeed
 const MAX_WINDOW_SEC = 6 * 3600; // a frontier window covers at most 6 hours
 const MAX_AGE_SEC = 89 * 86400; // the DOC index covers roughly the last 3 months
 const BACKOFF_SEC = 15 * 60; // matches the ~15 min IP block seen in practice
@@ -168,7 +168,10 @@ async function handleFailure(
   }
 
   let status = httpStatus === 429 ? "rate_limited" : "bad_response";
-  if (cp.fail_count >= FAIL_SPLIT_THRESHOLD && end - start > MIN_WINDOW_SEC) {
+  // Split only when both halves stay >= MIN_WINDOW_SEC: halving a window
+  // that is merely above the minimum produces children GDELT refuses
+  // permanently, which deadlocks the queue head.
+  if (cp.fail_count >= FAIL_SPLIT_THRESHOLD && end - start >= 2 * MIN_WINDOW_SEC) {
     const mid = start + Math.floor((end - start) / 2);
     if (fromPending) {
       cp.pending = [[start, mid], [mid, end], ...cp.pending.slice(1)];
@@ -263,7 +266,7 @@ async function collect(db: Client, question: Question): Promise<void> {
   // Saturated window: split it in half and queue the halves. The articles in
   // a truncated response are discarded on purpose — the halves re-fetch the
   // full set without truncation.
-  if (articles.length >= MAX_RECORDS && end - start > MIN_WINDOW_SEC) {
+  if (articles.length >= MAX_RECORDS && end - start >= 2 * MIN_WINDOW_SEC) {
     const mid = start + Math.floor((end - start) / 2);
     const rest = fromPending ? cp.pending.slice(1) : cp.pending;
     cp.pending = [[start, mid], [mid, end], ...rest];
