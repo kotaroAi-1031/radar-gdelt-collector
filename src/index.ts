@@ -8,22 +8,63 @@
 // the unified view locally, where the integrated store is derived data
 // that can be rebuilt from the per-question sources at any time.
 //
-// Design (see README.md): one firing handles exactly one question and one
-// time window, so a firing stays tiny on the Workers Free plan (10 ms
-// CPU). Which question a firing serves is derived statelessly from the
-// scheduled time (1-minute slots rotating over the questions), so no
-// shared coordination state exists anywhere. A fresh question database
-// backfills from the DOC index horizon (about 3 months back) before
-// settling into steady-state monitoring. The DOC API's 250-record
-// cap is handled by splitting saturated windows in half and queuing the
-// halves in the question's own checkpoint table — the time window is the
-// pagination. A window that keeps failing (a heavy query that GDELT
-// refuses outright behaves this way) is split the same way after repeated
-// failures, so one unanswerable window can never stall a question
-// forever. Rate limits are handled as state (`not_before`), never by
-// sleeping or hammering: a failed firing simply defers that question.
+// Design (README.md): one firing handles exactly one question and one time
+// window, so a firing stays tiny on the Workers Free plan (10 ms CPU).
+// Which question a firing serves is derived statelessly from the scheduled
+// time (1-minute slots rotating over the questions), so no shared
+// coordination state exists anywhere.
+//
+// Two lanes share each question's single checkpoint row:
+//
+//   live      keeps the last ~26 hours complete and takes priority whenever
+//             it is more than LIVE_MAX_LAG_SEC behind. One success repairs the
+//             whole gap, so an outage longer than the window still recovers in
+//             a call or two.
+//   backfill  walks the older timeline forward at most once per 15 minutes and
+//             never into the live lane's recent past.
+//
+// Progress is a cursor, not a bisection: the time window is the pagination.
+// A response capped at 250 records advances the cursor to the newest
+// `seendate` it contained, and the next call continues from there. A window
+// GDELT refuses as too heavy is the only thing that gets split.
+//
+// Rate limits are handled as state, never by sleeping or hammering, and they
+// never split a window: throttling is a property of the shared egress IP, not
+// of the window. Every failure keeps an excerpt of the response body, so a
+// 429 can be told apart from a heavy query, a horizon refusal and an HTML
+// error page after the fact.
 
 import { createClient, type Client } from "@libsql/client/web";
+import {
+  BACKOFF_MAX_LEVEL,
+  FETCH_TIMEOUT_MS,
+  QUESTIONS,
+  USER_AGENT,
+  type Question,
+} from "./config.ts";
+import { buildDocUrl, maxSeenEpoch, parseSeendate } from "./doc.ts";
+import { classifyResponse } from "./classify.ts";
+import {
+  advanceCursor,
+  backfillWindow,
+  backoffDelay,
+  backoffJitter,
+  chooseLane,
+  heavyRetry,
+  horizonProbe,
+  isBackoffSkip,
+  liveWindow,
+  nextWindowSec,
+} from "./lane.ts";
+import {
+  insertArticles,
+  loadCheckpoint,
+  loadHealth,
+  logRun,
+  recordCoverage,
+  recordHole,
+  saveCheckpoint,
+} from "./db.ts";
 
 interface Env {
   // One secret holding every question database's credentials:
@@ -31,41 +72,6 @@ interface Env {
   // Each token is scoped to its own database; the JSON wrapper only keeps
   // deployment to a single secret.
   TURSO_DATABASES_JSON: string;
-}
-
-interface Question {
-  id: string;
-  query: string;
-}
-
-// v1 keyword queries for the radar's six watch questions. They are tuned by
-// the observed `runs` counts (saturation vs. silence), not by guesswork.
-const QUESTIONS: Question[] = [
-  { id: "q1", query: '("Israel" OR "Gaza" OR "Iran" OR "Hormuz" OR "Hezbollah" OR "Hamas")' },
-  { id: "q2", query: '("cartel" OR "fentanyl" OR "cocaine trafficking" OR "drug smuggling") ("Mexico" OR "Colombia" OR "Venezuela" OR "Ecuador" OR "Caribbean")' },
-  { id: "q3", query: '"Japan" ("drug smuggling" OR "cocaine" OR "trafficking" OR "smuggling" OR "crime syndicate")' },
-  { id: "q4", query: '("Sam Altman" OR "Peter Thiel" OR "Y Combinator" OR "effective altruism" OR "Elon Musk")' },
-  { id: "q5", query: '("OpenAI" OR "Anthropic" OR "Google DeepMind")' },
-  { id: "q6", query: '("ransomware" OR "data breach" OR "cyberattack" OR "zero-day" OR "vulnerability disclosure")' },
-];
-
-const DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc";
-const USER_AGENT = "radar-gdelt-collector/0.1 (+https://github.com/kotaroAi-1031/radar-gdelt-collector)";
-const MAX_RECORDS = 250;
-const MIN_WINDOW_SEC = 2700; // GDELT rejects shorter timespans outright ("Timespan is too short.", HTTP 200 text); 45 min is the smallest window size observed to succeed
-const MAX_WINDOW_SEC = 6 * 3600; // a frontier window covers at most 6 hours
-const MAX_AGE_SEC = 89 * 86400; // the DOC index covers roughly the last 3 months
-const BACKOFF_SEC = 15 * 60; // matches the ~15 min IP block seen in practice
-const SLOT_SEC = 60; // cron fires every minute; one question per slot
-const FAIL_SPLIT_THRESHOLD = 3; // consecutive failures of one window before it is split
-
-interface Checkpoint {
-  next_start: number | null;
-  pending: [number, number][];
-  not_before: number;
-  fail_start: number | null;
-  fail_end: number | null;
-  fail_count: number;
 }
 
 type DatabaseConfig = Record<string, { url: string; authToken: string }>;
@@ -80,165 +86,76 @@ function clientFor(env: Env, questionId: string): Client {
   return createClient({ url: cfg.url, authToken: cfg.authToken });
 }
 
-function docDatetime(unixSec: number): string {
-  const d = new Date(unixSec * 1000);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
-}
-
-async function loadCheckpoint(db: Client, questionId: string): Promise<Checkpoint> {
-  const rs = await db.execute({
-    sql: "SELECT next_start, pending, not_before, fail_start, fail_end, fail_count FROM checkpoints WHERE question_id = ?",
-    args: [questionId],
-  });
-  const row = rs.rows[0];
-  if (!row) return { next_start: null, pending: [], not_before: 0, fail_start: null, fail_end: null, fail_count: 0 };
-  let pending: [number, number][] = [];
-  try {
-    const parsed = JSON.parse(String(row.pending));
-    if (Array.isArray(parsed)) pending = parsed as [number, number][];
-  } catch {
-    pending = [];
-  }
-  return {
-    next_start: row.next_start == null ? null : Number(row.next_start),
-    pending,
-    not_before: Number(row.not_before),
-    fail_start: row.fail_start == null ? null : Number(row.fail_start),
-    fail_end: row.fail_end == null ? null : Number(row.fail_end),
-    fail_count: row.fail_count == null ? 0 : Number(row.fail_count),
-  };
-}
-
-async function saveCheckpoint(db: Client, questionId: string, cp: Checkpoint): Promise<void> {
-  await db.execute({
-    sql:
-      "INSERT INTO checkpoints (question_id, next_start, pending, not_before, fail_start, fail_end, fail_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
-      "ON CONFLICT(question_id) DO UPDATE SET next_start = excluded.next_start, pending = excluded.pending, not_before = excluded.not_before, fail_start = excluded.fail_start, fail_end = excluded.fail_end, fail_count = excluded.fail_count, updated_at = excluded.updated_at",
-    args: [questionId, cp.next_start, JSON.stringify(cp.pending), cp.not_before, cp.fail_start, cp.fail_end, cp.fail_count, new Date().toISOString()],
-  });
-}
-
-async function logRun(
-  db: Client,
-  questionId: string,
-  windowStart: number | null,
-  windowEnd: number | null,
-  returned: number | null,
-  inserted: number | null,
-  status: string,
-  httpStatus: number | null = null,
-): Promise<void> {
-  await db.execute({
-    sql: "INSERT INTO runs (at, question_id, window_start, window_end, returned, inserted, status, http_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    args: [new Date().toISOString(), questionId, windowStart, windowEnd, returned, inserted, status, httpStatus],
-  });
-}
-
-// Handles one failed DOC call: backs the question off, and after
-// FAIL_SPLIT_THRESHOLD consecutive failures of the same window, splits the
-// window in half and queues the halves — the failure-driven twin of the
-// saturation split. Without this, a window GDELT refuses outright (too
-// heavy) is retried unchanged forever and the question stalls.
-async function handleFailure(
-  db: Client,
-  question: Question,
-  cp: Checkpoint,
-  start: number,
-  end: number,
-  fromPending: boolean,
-  httpStatus: number,
-): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
-  if (cp.fail_start === start && cp.fail_end === end) {
-    cp.fail_count += 1;
-  } else {
-    cp.fail_start = start;
-    cp.fail_end = end;
-    cp.fail_count = 1;
-  }
-
-  // Pin a fresh frontier window: while next_start is unset, the window is
-  // derived from `now` at each attempt and slides, so the failure identity
-  // above would never match twice and the count would never accumulate.
-  // Persisting the start makes the retry target the same window. (When
-  // the split below fires, it overwrites next_start with the window end.)
-  if (!fromPending && cp.next_start === null) {
-    cp.next_start = start;
-  }
-
-  let status = httpStatus === 429 ? "rate_limited" : "bad_response";
-  // Split only when both halves stay >= MIN_WINDOW_SEC: halving a window
-  // that is merely above the minimum produces children GDELT refuses
-  // permanently, which deadlocks the queue head.
-  if (cp.fail_count >= FAIL_SPLIT_THRESHOLD && end - start >= 2 * MIN_WINDOW_SEC) {
-    const mid = start + Math.floor((end - start) / 2);
-    if (fromPending) {
-      cp.pending = [[start, mid], [mid, end], ...cp.pending.slice(1)];
-    } else {
-      cp.pending = [[start, mid], [mid, end], ...cp.pending];
-      cp.next_start = end;
-    }
-    cp.fail_start = null;
-    cp.fail_end = null;
-    cp.fail_count = 0;
-    status = "failed_split";
-  }
-
-  cp.not_before = now + BACKOFF_SEC;
-  await saveCheckpoint(db, question.id, cp);
-  await logRun(db, question.id, start, end, null, null, status, httpStatus > 0 ? httpStatus : null);
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 async function collect(db: Client, question: Question): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowSec();
   const cp = await loadCheckpoint(db, question.id);
 
-  if (now < cp.not_before) {
-    await logRun(db, question.id, null, null, null, null, "backoff_skip");
+  if (isBackoffSkip(cp, now)) {
+    await logRun(db, {
+      questionId: question.id,
+      windowStart: null,
+      windowEnd: null,
+      returned: null,
+      inserted: null,
+      status: "backoff_skip",
+      httpStatus: null,
+      lane: "idle",
+      error: cp.last_error,
+    });
     return;
   }
 
-  // Choose the next window: queued split windows first, else the frontier.
-  let start: number;
-  let end: number;
-  let fromPending = false;
-  if (cp.pending.length > 0) {
-    [start, end] = cp.pending[0];
-    fromPending = true;
-  } else {
-    end = now;
-    // A fresh database backfills from the DOC horizon (~3 months): the
-    // frontier starts at the oldest indexed moment and advances
-    // chronologically, with split windows interleaved, until it reaches
-    // the present and settles into steady-state monitoring.
-    start = cp.next_start ?? now - MAX_AGE_SEC;
-    // A pinned frontier start (persisted after a failure, see
-    // handleFailure) is used verbatim so the retried window is identical
-    // and its failures accumulate toward a split. Only a start that has
-    // fallen more than one window behind the DOC horizon is clamped.
-    if (start < now - MAX_AGE_SEC - MAX_WINDOW_SEC) start = now - MAX_AGE_SEC;
-    if (end - start > MAX_WINDOW_SEC) end = start + MAX_WINDOW_SEC;
-    if (start >= end) {
-      await logRun(db, question.id, start, end, 0, 0, "idle");
-      return;
-    }
+  const lane = chooseLane(cp, now);
+  if (lane === "idle") {
+    await logRun(db, {
+      questionId: question.id,
+      windowStart: null,
+      windowEnd: null,
+      returned: null,
+      inserted: null,
+      status: "idle",
+      httpStatus: null,
+      lane: "idle",
+      error: null,
+    });
+    return;
   }
 
-  const url = new URL(DOC_ENDPOINT);
-  url.searchParams.set("query", question.query);
-  url.searchParams.set("mode", "artlist");
-  url.searchParams.set("format", "json");
-  url.searchParams.set("maxrecords", String(MAX_RECORDS));
-  url.searchParams.set("startdatetime", docDatetime(start));
-  url.searchParams.set("enddatetime", docDatetime(end));
+  const window = lane === "live" ? liveWindow(cp, now) : backfillWindow(cp, now);
+  if (!window) {
+    await logRun(db, {
+      questionId: question.id,
+      windowStart: null,
+      windowEnd: null,
+      returned: null,
+      inserted: null,
+      status: "idle",
+      httpStatus: null,
+      lane,
+      error: null,
+    });
+    return;
+  }
 
+  // Pin the cursor on the first attempt so a failing window is retried
+  // identically instead of sliding forward with the clock (the q1 deadlock).
+  if (lane === "live" && cp.live_start === null) cp.live_start = window.start;
+  if (lane === "backfill" && cp.next_start === null) cp.next_start = window.start;
+  if (lane === "backfill") cp.last_backfill_at = now;
+
+  if (window.hole) await recordHole(db, question.id, window.hole);
+
+  const url = buildDocUrl(question.query, window.start, window.end);
   let bodyText = "";
   let httpStatus = 0;
   try {
-    const res = await fetch(url.toString(), {
+    const res = await fetch(url, {
       headers: { "User-Agent": USER_AGENT },
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     httpStatus = res.status;
     bodyText = await res.text();
@@ -246,131 +163,141 @@ async function collect(db: Client, question: Question): Promise<void> {
     httpStatus = -1;
   }
 
-  // GDELT sometimes answers errors as plain text under HTTP 200, and heavy
-  // queries can be refused outright: anything that is not a JSON object is a
-  // failed call. Defer this question instead of retrying inside the firing.
-  if (httpStatus !== 200 || !bodyText.trimStart().startsWith("{")) {
-    await handleFailure(db, question, cp, start, end, fromPending, httpStatus);
-    return;
-  }
+  const classified = classifyResponse(httpStatus, bodyText);
 
-  let articles: Record<string, unknown>[] = [];
-  try {
-    const data = JSON.parse(bodyText) as { articles?: Record<string, unknown>[] };
-    if (Array.isArray(data.articles)) articles = data.articles;
-  } catch {
-    await handleFailure(db, question, cp, start, end, fromPending, httpStatus);
-    return;
-  }
-
-  // Saturated window: split it in half and queue the halves. The articles in
-  // a truncated response are discarded on purpose — the halves re-fetch the
-  // full set without truncation.
-  if (articles.length >= MAX_RECORDS && end - start >= 2 * MIN_WINDOW_SEC) {
-    const mid = start + Math.floor((end - start) / 2);
-    const rest = fromPending ? cp.pending.slice(1) : cp.pending;
-    cp.pending = [[start, mid], [mid, end], ...rest];
+  if (classified.kind === "ok") {
+    const articles = classified.articles;
+    const inserted = await insertArticles(db, question.id, articles);
+    const advance = advanceCursor(window, articles.length, maxSeenEpoch(articles));
+    if (advance.hole) await recordHole(db, question.id, advance.hole);
+    if (lane === "live") {
+      cp.live_start = Math.max(advance.cursor, cp.live_start ?? advance.cursor);
+    } else {
+      cp.next_start = advance.cursor;
+    }
+    cp.window_sec = nextWindowSec(cp.window_sec, articles.length);
+    cp.backoff_level = 0;
+    cp.not_before = 0;
     cp.fail_start = null;
     cp.fail_end = null;
     cp.fail_count = 0;
+    cp.last_ok_at = new Date().toISOString();
+    cp.last_status = advance.capped ? "ok_capped" : "ok";
+    cp.last_error = null;
     await saveCheckpoint(db, question.id, cp);
-    await logRun(db, question.id, start, end, articles.length, 0, "split", 200);
+    await recordCoverage(db, question.id, window.start, window.end, lane);
+    await logRun(db, {
+      questionId: question.id,
+      windowStart: window.start,
+      windowEnd: window.end,
+      returned: articles.length,
+      inserted,
+      status: advance.capped ? "ok_capped" : "ok",
+      httpStatus,
+      lane,
+      error: null,
+    });
     return;
   }
 
-  let inserted = 0;
-  if (articles.length > 0) {
-    const fetchedAt = new Date().toISOString();
-    const statements = articles
-      .filter((a) => typeof a.url === "string" && a.url.length > 0)
-      .map((a) => {
-        const toneNum = typeof a.tone === "number" ? a.tone : Number(a.tone);
-        return {
-          sql: "INSERT OR IGNORE INTO articles (question_id, url, seendate, title, domain, language, source_country, tone, social_image, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          args: [
-            question.id,
-            a.url as string,
-            typeof a.seendate === "string" ? a.seendate : null,
-            typeof a.title === "string" ? a.title : null,
-            typeof a.domain === "string" ? a.domain : null,
-            typeof a.language === "string" ? a.language : null,
-            typeof a.sourcecountry === "string" ? a.sourcecountry : null,
-            Number.isFinite(toneNum) ? toneNum : null,
-            typeof a.socialimage === "string" ? a.socialimage : null,
-            fetchedAt,
-          ],
-        };
-      });
-    if (statements.length > 0) {
-      const results = await db.batch(statements, "write");
-      inserted = results.reduce((sum, r) => sum + (r.rowsAffected ?? 0), 0);
+  let status: string;
+  if (classified.kind === "rate_limited") {
+    // Throttling is never window-specific: back off, never split.
+    cp.backoff_level = Math.min(cp.backoff_level + 1, BACKOFF_MAX_LEVEL);
+    cp.not_before = now + backoffDelay(cp.backoff_level, backoffJitter(cp.backoff_level));
+    status = "rate_limited";
+  } else if (classified.kind === "heavy") {
+    // The one case where the window itself is the problem: retry smaller, and
+    // at the floor step past it so it cannot stall the lane forever.
+    const retry = heavyRetry(cp, window);
+    cp.window_sec = retry.windowSec;
+    if (retry.advance) {
+      if (retry.advance.hole) await recordHole(db, question.id, retry.advance.hole);
+      if (lane === "live") cp.live_start = retry.advance.cursor;
+      else cp.next_start = retry.advance.cursor;
     }
+    cp.not_before = now + backoffDelay(1);
+    status = "heavy";
+  } else if (classified.kind === "horizon") {
+    // Beyond the DOC index: step forward and record the skipped range instead
+    // of retrying a window that slides with the clock.
+    const advance = horizonProbe(window);
+    if (advance.hole) await recordHole(db, question.id, advance.hole);
+    if (lane === "live") cp.live_start = advance.cursor;
+    else cp.next_start = advance.cursor;
+    cp.not_before = now + backoffDelay(1);
+    status = "horizon";
+  } else {
+    cp.backoff_level = Math.min(cp.backoff_level + 1, BACKOFF_MAX_LEVEL);
+    cp.not_before = now + backoffDelay(cp.backoff_level, backoffJitter(cp.backoff_level));
+    status = "transient";
   }
 
-  if (fromPending) {
-    cp.pending = cp.pending.slice(1);
-  } else {
-    cp.next_start = end;
-  }
-  cp.not_before = 0;
-  cp.fail_start = null;
-  cp.fail_end = null;
-  cp.fail_count = 0;
+  cp.last_status = status;
+  cp.last_error = classified.error;
   await saveCheckpoint(db, question.id, cp);
-  await logRun(
-    db,
-    question.id,
-    start,
-    end,
-    articles.length,
-    inserted,
-    articles.length >= MAX_RECORDS ? "ok_capped" : "ok",
-    200,
-  );
+  await logRun(db, {
+    questionId: question.id,
+    windowStart: window.start,
+    windowEnd: window.end,
+    returned: null,
+    inserted: null,
+    status,
+    httpStatus: httpStatus > 0 ? httpStatus : null,
+    lane,
+    error: classified.error,
+  });
 }
 
 export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     // Stateless rotation: the 1-minute slot number picks the question, so
     // every question is served once per 6 minutes with no shared state.
-    // One call per firing keeps a firing far inside both the DOC API's
-    // per-IP rate budget (one call per minute overall) and the Workers
-    // Free 10 ms CPU budget, while the cadence still drains split queues
-    // and backfill much faster than real time.
-    const slot = Math.floor(controller.scheduledTime / (SLOT_SEC * 1000));
+    // One call per firing keeps a firing far inside the Workers Free 10 ms
+    // CPU budget, while the cadence still drains split queues and backfill
+    // much faster than real time.
+    const slot = Math.floor(controller.scheduledTime / (60 * 1000));
     const question = QUESTIONS[slot % QUESTIONS.length];
-    ctx.waitUntil(collect(clientFor(env, question.id), question));
+    ctx.waitUntil(
+      collect(clientFor(env, question.id), question).catch((error: unknown) => {
+        console.error(
+          `collect failed for ${question.id}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }),
+    );
   },
 
   // Read-only health view across all question databases.
   async fetch(_request: Request, env: Env): Promise<Response> {
+    const now = nowSec();
     const perQuestion = await Promise.all(
       QUESTIONS.map(async (q) => {
         try {
           const db = clientFor(env, q.id);
-          const counts = await db.execute({
-            sql: "SELECT COUNT(*) AS n FROM articles",
-            args: [],
-          });
-          const runs = await db.execute({
-            sql: "SELECT at, returned, inserted, status FROM runs ORDER BY id DESC LIMIT 3",
-            args: [],
-          });
+          const health = await loadHealth(db, q.id, now);
+          const lastSeenEpoch = parseSeendate(health.lastSeen);
           return {
             question_id: q.id,
-            articles: Number(counts.rows[0]?.n ?? 0),
-            recentRuns: runs.rows.map((r) => ({
-              at: String(r.at),
-              returned: r.returned === null ? null : Number(r.returned),
-              inserted: r.inserted === null ? null : Number(r.inserted),
-              status: String(r.status),
-            })),
+            articles: health.articles,
+            last_seen: health.lastSeen,
+            last_seen_age_hours:
+              lastSeenEpoch === null ? null : Math.max(0, (now - lastSeenEpoch) / 3600),
+            live_lag_hours:
+              health.liveStart === null ? null : Math.max(0, (now - health.liveStart) / 3600),
+            uncovered_hours_24h: health.uncoveredHours24h,
+            live_start: health.liveStart,
+            next_start: health.nextStart,
+            last_ok_at: health.lastOkAt,
+            last_status: health.lastStatus,
+            backoff_level: health.backoffLevel,
+            recentRuns: health.recentRuns,
           };
         } catch (e) {
           return { question_id: q.id, error: e instanceof Error ? e.message : String(e) };
         }
       }),
     );
-    return Response.json({ ok: true, perQuestion });
+    return Response.json({ ok: true, generated_at: new Date().toISOString(), perQuestion });
   },
 } satisfies ExportedHandler<Env>;

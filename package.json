@@ -12,7 +12,8 @@
   "scripts": {
     "dev": "cf dev",
     "deploy": "cf deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
   },
   "packageManager": "pnpm@12.16.1",
   "dependencies": {

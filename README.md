@@ -95,35 +95,53 @@ outside Cloudflare so that reporting keeps working even when an
 upstream API or Cloudflare itself is unreachable.
 
 How it collects, following measured practice for the GDELT DOC 2.0 API
-(see `src/index.ts` for the implementation):
+(see `src/` for the implementation and `docs/RUNBOOK-PHASE0.md` for the
+migration runbook):
 
 - A cron firing handles **one watch question and one time window**, so a
   firing stays far inside the Free plan's 10 ms CPU budget. Which
   question a firing serves is derived statelessly from the scheduled
   time (1-minute slots rotating over the six questions), so no shared
-  coordination state exists anywhere. One call per firing keeps every
-  firing far inside the DOC API's per-IP rate budget and the Workers
-  Free CPU budget; a fresh question database backfills from the DOC
-  index horizon (about 3 months) before settling into steady state.
-- The DOC API returns at most 250 articles per query with no pagination.
-  When a window comes back saturated, it is **split in half and the
-  halves are queued** in the checkpoint state — the time window is the
-  pagination. Windows never split below 30 minutes; a window still
-  saturated at that floor is stored and logged as `ok_capped`.
-- Rate limits (measured: roughly one request per 5 s per IP, with IP
-  blocks lasting ~15 minutes after bursts) are handled as **state, not
-  retries**: a failed or refused call defers that question for 15
-  minutes via `not_before` in `migrations/0001_init.sql`'s checkpoints
-  table. Errors returned as plain text under HTTP 200 are treated as
-  failures, as is any non-JSON body.
-- A window that fails repeatedly is split too: after 3 consecutive
-  failures of the same window, it is halved and the halves are queued
-  (`migrations/0002_failure_split.sql`), so a query GDELT refuses
-  outright for being too heavy cannot stall its question forever. Every
-  run row records the HTTP status, so failures stay diagnosable.
+  coordination state exists anywhere.
+- Two lanes share each question's checkpoint row. **live** keeps the last
+  ~26 hours complete and takes priority once it is more than 3 hours
+  behind; a single success repairs the whole gap, so an outage longer
+  than the window still recovers in a call or two. **backfill** walks the
+  older timeline forward at most once per 15 minutes and never into the
+  live lane's recent past. The lane is chosen from the checkpoint alone,
+  so nothing is coordinated across firings.
+- **The window is the cursor.** A response capped at 250 records advances
+  the cursor to the newest `seendate` it contained, and the next call
+  continues from there; a complete response advances it to the window
+  end. Nothing is discarded and nothing is bisected. `sort=dateasc` is
+  what makes this walk possible.
+- Window length adapts (AIMD): a response comfortably under the cap
+  doubles the next window (up to 24 hours), a saturated one halves it
+  (down to GDELT's 45-minute minimum). Measured windows returned ~15
+  articles each, so the 6-hour default was leaving most of the call
+  budget on the table.
+- **Rate limits never split a window.** Throttling is a property of the
+  shared egress IP, not of the window, and the measured failure mix was
+  98% throttling against three genuine saturations. Failures are
+  classified from the HTTP status plus the body text (`rate_limited`,
+  `heavy`, `horizon`, `transient`), and each class gets its own handling:
+  exponential backoff with jitter for throttling and transient errors, a
+  smaller window only for `heavy`, and a recorded one-hour step forward
+  for `horizon`. Every failed run stores the first 200 characters of the
+  body in `runs.error`, because `http_status` alone could not tell a
+  horizon refusal from an HTML error page.
+- The DOC index horizon (about 3 months) is applied with a one-day margin,
+  and the clamped cursor is pinned rather than re-derived from the clock.
+  Windows that are deliberately skipped — horizon clamps, unanswerable
+  minimum-length windows, a saturated second that cannot advance — are
+  written to `coverage_holes`, so a loss is recorded, never silent.
+- Every successful window writes a `coverage` row, which is what the
+  health view uses to report uncovered hours in the last 24 hours.
 - Inserts are idempotent (`INSERT OR IGNORE` on `(question_id, url)`),
-  and every firing leaves an audit row in the `runs` table. The Worker
-  also serves a read-only JSON health view of counts and recent runs.
+  and every firing leaves an audit row in `runs` (`lane`, `error`, and
+  `http_status` included). The Worker also serves a read-only JSON health
+  view: article count, newest `seendate`, live lag, uncovered hours,
+  backoff level and the last runs.
 
 Layout:
 
@@ -132,10 +150,20 @@ Layout:
   connects to the per-question Turso databases with the single
   `TURSO_DATABASES_JSON` secret, a JSON map of question id to
   `{ url, authToken }` (each token scoped to its own database).
-- `src/index.ts` — the collector (question queries are v1 keyword sets,
-  tuned by the observed run counts).
+- `src/index.ts` — the Worker entry (`scheduled` and `fetch`).
+- `src/config.ts` — tunables and the six watch questions.
+- `src/lane.ts` — the pure state machine (lane choice, windows, cursor
+  advance, AIMD, backoff).
+- `src/classify.ts` — response classification and error excerpts.
+- `src/doc.ts` — request building and `seendate` parsing.
+- `src/db.ts` — checkpoint, runs, articles, coverage and health queries.
 - `migrations/` — the database schema, applied to every question
   database (a fleet operation of six, scripted once).
+- `scripts/snapshot-state.mjs` — read-only pre-migration snapshot.
+- `test/` — `node --test` suite (no test-only dependencies).
+
+Tests and typecheck: `pnpm test` (Node's built-in runner, TypeScript via
+Node's type stripping) and `pnpm typecheck`. Neither needs a database.
 
 Tooling: the `cf` CLI (Cloudflare's official agentic CLI, beta) is the
 primary tool, pinned exactly in `package.json`; `cf auth login` performs
