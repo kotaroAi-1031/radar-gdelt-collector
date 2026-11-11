@@ -200,12 +200,13 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
       # The collector has no test-only dependencies: the suite runs on
-      # `node --test` with Node's TypeScript stripping. Dependencies are
-      # installed for the typecheck (typescript, @cloudflare/workers-types)
-      # and to keep the lockfile the single source of truth.
+      # `node --test` with Node's TypeScript stripping. `--ignore-scripts`
+      # avoids pnpm's ERR_PNPM_IGNORED_BUILDS for workerd's postinstall,
+      # which this job does not need (no dev server, no bundling); the
+      # typecheck needs only typescript and @cloudflare/workers-types.
       - name: Install dependencies
         timeout-minutes: 15
-        run: nix shell .#nodejs_26 .#pnpm --command pnpm install --frozen-lockfile
+        run: nix shell .#nodejs_26 .#pnpm --command pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Typecheck the Worker
         timeout-minutes: 10
