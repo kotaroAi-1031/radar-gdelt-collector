@@ -181,3 +181,36 @@ jobs:
       - name: Typecheck infra with tsrs
         timeout-minutes: 10
         run: nix shell .#nodejs_26 .#pnpm --command pnpm --dir infra run typecheck
+
+  test:
+    name: test (node:test, worker typecheck)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        timeout-minutes: 5
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      # The collector has no test-only dependencies: the suite runs on
+      # `node --test` with Node's TypeScript stripping. Dependencies are
+      # installed for the typecheck (typescript, @cloudflare/workers-types)
+      # and to keep the lockfile the single source of truth.
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: nix shell .#nodejs_26 .#pnpm --command pnpm install --frozen-lockfile
+
+      - name: Typecheck the Worker
+        timeout-minutes: 10
+        run: nix shell .#nodejs_26 .#pnpm --command pnpm run typecheck
+
+      - name: Run unit tests
+        timeout-minutes: 10
+        run: nix shell .#nodejs_26 .#pnpm --command pnpm test
