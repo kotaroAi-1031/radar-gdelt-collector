@@ -167,14 +167,14 @@ importers:
   .:
     dependencies:
       '@effect/platform-bun':
-        specifier: ^4.1.4
-        version: 4.1.4(effect@4.1.4)
+        specifier: ^4.1.5
+        version: 4.1.5(effect@4.1.5)
       alchemy:
         specifier: 2.0.0-beta.87
-        version: 2.0.0-beta.87(@effect/platform-bun@4.1.4(effect@4.1.4))(effect@4.1.4)(ws@8.22.1)
+        version: 2.0.0-beta.87(@effect/platform-bun@4.1.5(effect@4.1.5))(effect@4.1.5)(ws@8.23.0)
       effect:
-        specifier: ^4.1.4
-        version: 4.1.4
+        specifier: ^4.1.5
+        version: 4.1.5
     devDependencies:
       '@types/node':
         specifier: ^26.6.6
@@ -200,16 +200,16 @@ packages:
       react-devtools-core:
         optional: true
 
-  '@effect/platform-bun@4.1.4':
-    resolution: {integrity: sha512-Vdq82GOrD5HVF43aXVwHeX+4uIOrgAnjju9MEyizzFZ3yt3A6x9prtmHej1q/zAOaeNddtkpPr2ExHEvZ13S6Q==}
+  '@effect/platform-bun@4.1.5':
+    resolution: {integrity: sha512-VzUugWhIKQSWp/xtFrYIrCISDcUXWrCFfxSkqg8ul0DZgo23WRqfz+38Y3mJ2NenUv5kUj14FnjLohm2t8ZGCw==}
     peerDependencies:
-      effect: ^4.1.4
+      effect: ^4.1.5
 
-  '@effect/platform-node-shared@4.1.4':
-    resolution: {integrity: sha512-DWdfphHGOFJNj/mYadgpT3jIm8aRXDcPrQiGXFBH4p2H4XmA7iYMrPsI8NxVgZ7kNX0q1+FGJZJama0tINHRAg==}
+  '@effect/platform-node-shared@4.1.5':
+    resolution: {integrity: sha512-JzlrYe4uKaBFTWihBRXo2pDjkUVB39kQpKdGfXdbp7Co5sKT8hbcjOmdB5pg/WOYESdGTddd3fxD4lwlZELbZQ==}
     engines: {node: '>=22.19.0'}
     peerDependencies:
-      effect: ^4.1.4
+      effect: ^4.1.5
 
   '@oxc-project/types@0.156.0':
     resolution: {integrity: sha512-1Duyg48TdJNdyhEB8Xn1L36bT9Pv6GUtlKjHxOys8xkaF/rQq3XJE+bAurSK/AgIz5mGFsb77cn9Pb20+WCScw==}
@@ -394,8 +394,8 @@ packages:
     resolution: {integrity: sha512-TQMmc3w+5AxjpL8iIiwebF73dRDF4fBIieAqGn9RGCWaEVwQ6Fb2cGe31Yns0RRIzii5goJ1Y7xbMwo1TxMplw==}
     engines: {node: '>= 20.19.0'}
 
-  effect@4.1.4:
-    resolution: {integrity: sha512-Tgrv/9FN+TZYyOn8XSli+fVqAfwDrDAkiX5Uu9vztINb675VTQdhD0gWI5Kzvhlh9QqzjZvw72iugqw5pwoghQ==}
+  effect@4.1.5:
+    resolution: {integrity: sha512-xyR20KhQI0vg2gD8ILUSQRTTESEYJ0JKdP+QD8J37xbwPTqXRxFM/l0+vUVD9fuSvoYruoTqyt33C4FZv1s4TQ==}
 
   fdir@6.5.0:
     resolution: {integrity: sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==}
@@ -437,8 +437,8 @@ packages:
   undici-types@8.9.0:
     resolution: {integrity: sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==}
 
-  ws@8.22.1:
-    resolution: {integrity: sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g==}
+  ws@8.23.0:
+    resolution: {integrity: sha512-wCkmX8QMOrKjgO8HW2WyDbTSGeqkocxgDzS9iR79rEAexty6/2qzilx3Ag8Tqf9ykop3irLKle0MtVn5qjVnoQ==}
     engines: {node: '>=10.0.0'}
     peerDependencies:
       bufferutil: ^4.0.1
@@ -463,19 +463,19 @@ snapshots:
 
   '@alchemy.run/sigil@0.1.0-alpha.4': {}
 
-  '@effect/platform-bun@4.1.4(effect@4.1.4)':
+  '@effect/platform-bun@4.1.5(effect@4.1.5)':
     dependencies:
-      '@effect/platform-node-shared': 4.1.4(effect@4.1.4)
-      effect: 4.1.4
+      '@effect/platform-node-shared': 4.1.5(effect@4.1.5)
+      effect: 4.1.5
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
 
-  '@effect/platform-node-shared@4.1.4(effect@4.1.4)':
+  '@effect/platform-node-shared@4.1.5(effect@4.1.5)':
     dependencies:
       '@types/ws': 8.18.2
-      effect: 4.1.4
-      ws: 8.22.1
+      effect: 4.1.5
+      ws: 8.23.0
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
@@ -558,12 +558,12 @@ snapshots:
     dependencies:
       '@types/node': 26.6.6
 
-  alchemy@2.0.0-beta.87(@effect/platform-bun@4.1.4(effect@4.1.4))(effect@4.1.4)(ws@8.22.1):
+  alchemy@2.0.0-beta.87(@effect/platform-bun@4.1.5(effect@4.1.5))(effect@4.1.5)(ws@8.23.0):
     dependencies:
       '@alchemy.run/node-utils': 2.0.0-beta.87
       '@alchemy.run/sigil': 0.1.0-alpha.4
       capnweb: 0.12.0
-      effect: 4.1.4
+      effect: 4.1.5
       fflate: 0.8.3
       pathe: 2.0.3
       picomatch: 4.0.7
@@ -571,8 +571,8 @@ snapshots:
       tinyglobby: 0.2.17
       yaml: 2.9.1
     optionalDependencies:
-      '@effect/platform-bun': 4.1.4(effect@4.1.4)
-      ws: 8.22.1
+      '@effect/platform-bun': 4.1.5(effect@4.1.5)
+      ws: 8.23.0
     transitivePeerDependencies:
       - '@types/react'
       - react-devtools-core
@@ -583,7 +583,7 @@ snapshots:
     dependencies:
       readdirp: 5.1.1
 
-  effect@4.1.4: {}
+  effect@4.1.5: {}
 
   fdir@6.5.0(picomatch@4.0.7):
     optionalDependencies:
@@ -635,6 +635,6 @@ snapshots:
 
   undici-types@8.9.0: {}
 
-  ws@8.22.1: {}
+  ws@8.23.0: {}
 
   yaml@2.9.1: {}
